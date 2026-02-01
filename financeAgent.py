@@ -30,13 +30,21 @@ def save_watchlist(watchlist):
     with open(WATCHLIST_FILE, "w") as f:
         json.dump(watchlist, f, indent=2)
 
+# ─── SAFE Yahoo Finance Fetch (RATE-LIMIT FIX) ─────────────────
+@st.cache_data(ttl=300)  # cache for 5 minutes
+def get_stock_info(symbol):
+    try:
+        return yf.Ticker(symbol).info
+    except Exception:
+        return {}
+
 # ─── Page Config ───────────────────────────────────────────────
 st.set_page_config(page_title="AI Equity Research Agent", layout="wide")
 st.title("🧠 AI Equity Research Agent")
 
 # ─── Session State ─────────────────────────────────────────────
 if "watchlist" not in st.session_state:
-    st.session_state.watchlist = load_watchlist()   # ✅ CHANGED (load)
+    st.session_state.watchlist = load_watchlist()
 
 if "selected_symbol" not in st.session_state:
     st.session_state.selected_symbol = None
@@ -58,7 +66,7 @@ with st.sidebar:
         sym = new_sym.strip().upper()
         if sym and sym not in st.session_state.watchlist:
             st.session_state.watchlist.append(sym)
-            save_watchlist(st.session_state.watchlist)   # ✅ ADDED (save)
+            save_watchlist(st.session_state.watchlist)
             st.rerun()
 
     st.divider()
@@ -74,7 +82,7 @@ with st.sidebar:
             with col2:
                 if st.button("×", key=f"rm_{sym}_{idx}"):
                     st.session_state.watchlist.pop(idx)
-                    save_watchlist(st.session_state.watchlist)  # ✅ ADDED (save)
+                    save_watchlist(st.session_state.watchlist)
                     if st.session_state.selected_symbol == sym:
                         st.session_state.selected_symbol = None
                     st.rerun()
@@ -120,8 +128,11 @@ if should_analyze and symbol_to_use:
         symbol += ".NS"
 
     stock = yf.Ticker(symbol)
-    info = stock.info or {}
 
+    # ✅ SAFE info fetch (rate-limit protected)
+    info = get_stock_info(symbol)
+
+    # robust fetching
     try:
         fast = stock.fast_info
         current_price = fast.get("lastPrice") or fast.get("regularMarketPreviousClose")
