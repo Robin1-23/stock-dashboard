@@ -1,344 +1,270 @@
 import streamlit as st
 from phi.agent import Agent
 from phi.model.groq import Groq
+from phi.model.openai import OpenAIChat
 from phi.tools.yfinance import YFinanceTools
 from phi.tools.duckduckgo import DuckDuckGo
-import os
-from dotenv import load_dotenv
-import openai
-from phi.model.openai import OpenAIChat
-
-import pandas as pd
 import yfinance as yf
-import re
+import os
+import json
+from dotenv import load_dotenv
 
-# Load API keys
+# ─── Environment ───────────────────────────────────────────────
 load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
-os.environ["GROQ_API_KEY"] = os.getenv("GROQ_API_KEY")
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY", "")
+os.environ["GROQ_API_KEY"] = os.getenv("GROQ_API_KEY", "")
 
-# ---------------- CSS ----------------
-st.markdown("""
-    <style>
-    .main { padding: 20px; }
-    .stButton>button { background-color: #4CAF50; color: white; border-radius: 5px; }
-    .stTextInput>div>input { border-radius: 5px; }
-    h1, h2, h3 { color: #2c3e50; }
-    .news-item { margin-bottom: 15px; padding: 10px; border-left: 4px solid #3498db; }
-    table { border-collapse: collapse; width: 100%; }
-    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-    th { background-color: #f2f2f2; }
-    </style>
-""", unsafe_allow_html=True)
+# ─── Watchlist persistence ─────────────────────────────────────
+WATCHLIST_FILE = "watchlist.json"
 
-# ---------------- Session state for watchlist ----------------
+def load_watchlist():
+    if os.path.exists(WATCHLIST_FILE):
+        try:
+            with open(WATCHLIST_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return []
+    return []
+
+def save_watchlist(watchlist):
+    with open(WATCHLIST_FILE, "w") as f:
+        json.dump(watchlist, f, indent=2)
+
+# ─── Page Config ───────────────────────────────────────────────
+st.set_page_config(page_title="AI Equity Research Agent", layout="wide")
+st.title("🧠 AI Equity Research Agent")
+
+# ─── Session State ─────────────────────────────────────────────
 if "watchlist" not in st.session_state:
-    st.session_state.watchlist = []
+    st.session_state.watchlist = load_watchlist()   # ✅ CHANGED (load)
 
-# ---------------- Sidebar: Watchlist ----------------
+if "selected_symbol" not in st.session_state:
+    st.session_state.selected_symbol = None
+
+if "analyze_trigger" not in st.session_state:
+    st.session_state.analyze_trigger = 0
+
+# ─── Sidebar ───────────────────────────────────────────────────
 with st.sidebar:
-    st.title("Watchlist")
+    st.header("📌 Watchlist")
 
-    new_symbol = st.text_input(
-        "Add symbol",
-        value="",
-        placeholder="e.g. TCS, INFY, AAPL",
-        key="watchlist_input"
+    new_sym = st.text_input(
+        "Add Symbol",
+        placeholder="TCS, AAPL, RELIANCE",
+        key="add_input"
     )
 
-    if st.button("Add to watchlist"):
-        if new_symbol.strip():
-            sym = new_symbol.strip().upper()
-            if sym not in st.session_state.watchlist:
-                st.session_state.watchlist.append(sym)
-            else:
-                st.info(f"{sym} is already in your watchlist.")
+    if st.button("Add to Watchlist", use_container_width=True):
+        sym = new_sym.strip().upper()
+        if sym and sym not in st.session_state.watchlist:
+            st.session_state.watchlist.append(sym)
+            save_watchlist(st.session_state.watchlist)   # ✅ ADDED (save)
+            st.rerun()
 
-    st.markdown("### Saved Symbols")
-    to_remove = []
+    st.divider()
 
     if st.session_state.watchlist:
-        for sym in st.session_state.watchlist:
-            col1, col2 = st.columns([3, 1])
+        for idx, sym in enumerate(st.session_state.watchlist):
+            col1, col2 = st.columns([5, 1])
             with col1:
-                if st.button(sym, key=f"wl_{sym}"):
-                    st.session_state.selected_from_watchlist = sym
+                if st.button(sym, key=f"sel_{sym}_{idx}", use_container_width=True):
+                    st.session_state.selected_symbol = sym
+                    st.session_state.analyze_trigger += 1
+                    st.rerun()
             with col2:
-                if st.button("❌", key=f"rm_{sym}"):
-                    to_remove.append(sym)
+                if st.button("×", key=f"rm_{sym}_{idx}"):
+                    st.session_state.watchlist.pop(idx)
+                    save_watchlist(st.session_state.watchlist)  # ✅ ADDED (save)
+                    if st.session_state.selected_symbol == sym:
+                        st.session_state.selected_symbol = None
+                    st.rerun()
     else:
-        st.caption("No symbols yet. Add one above.")
+        st.caption("Watchlist is empty")
 
-    for sym in to_remove:
-        if sym in st.session_state.watchlist:
-            st.session_state.watchlist.remove(sym)
+    st.divider()
+    st.header("Quick Position Calc")
 
-# ---------------- App title ----------------
-st.title("Stock Analysis Dashboard")
-st.markdown("""
-Enter an Indian stock ticker (e.g., **TCS**, **RELIANCE**, **INFY**).  
-If no exchange suffix is provided, the app will **automatically assume NSE (.NS)**.
-""")
+    qty = st.number_input("Quantity", min_value=0, step=1, value=0)
+    buy_price = st.number_input("Avg Buy Price", min_value=0.0, value=0.0, step=0.01)
 
-# ---------------- Main Inputs ----------------
-ticker = st.text_input(
-    "Stock Ticker",
-    value="TCS",
-    placeholder="Enter ticker like TCS, RELIANCE, TCS.NS, TCS.BO, AAPL",
+# ─── Main Area ─────────────────────────────────────────────────
+ticker_input = st.text_input(
+    "Stock Symbol",
+    value=st.session_state.selected_symbol or "TCS",
+    key=f"main_ticker_{st.session_state.analyze_trigger}"
 )
 
-submit_button = st.button("Get Stock Info")
-
-# Watchlist click detection
-selected_from_watchlist = (
-    st.session_state.pop("selected_from_watchlist", None)
-    if "selected_from_watchlist" in st.session_state
-    else None
+should_analyze = (
+    st.button("Analyze Stock", type="primary", use_container_width=True)
+    or st.session_state.analyze_trigger > 0
 )
 
-# ---------------- Helper: normalize ticker ----------------
-def normalize_ticker(t: str) -> str:
-    if not t:
-        return t
-    t = t.strip().upper()
-    if t.endswith(".NS") or t.endswith(".BO"):
-        return t
-    if "." in t:  # user already provided exchange
-        return t
-    return t + ".NS"  # default India NSE
+symbol_to_use = ticker_input.strip().upper() if ticker_input else st.session_state.selected_symbol
 
-# ---------------- Agents ----------------
-websearch_agent = Agent(
-    name="Web Search",
-    role="Search the web",
-    model=Groq(id="llama-3.3-70b-versatile"),
-    tools=[DuckDuckGo()],
-    instructions=["Always include sources."],
-    show_tool_calls=False,
-    markdown=True,
-)
+# ─── Helpers ───────────────────────────────────────────────────
+def safe_format(value, fmt="{:,.2f}", fallback="—"):
+    if value is None:
+        return fallback
+    try:
+        return fmt.format(value)
+    except:
+        return str(value)
 
-financeAgent = Agent(
-    name="Finance Agent",
-    model=OpenAIChat(id="gpt-4o-mini"),
-    tools=[
-        YFinanceTools(
-            stock_price=True,
-            analyst_recommendations=True,
-            stock_fundamentals=True,
-            company_news=True,
+# ─── Run Analysis ──────────────────────────────────────────────
+if should_analyze and symbol_to_use:
+
+    st.session_state.analyze_trigger = 0
+
+    symbol = symbol_to_use
+    if "." not in symbol:
+        symbol += ".NS"
+
+    stock = yf.Ticker(symbol)
+    info = stock.info or {}
+
+    try:
+        fast = stock.fast_info
+        current_price = fast.get("lastPrice") or fast.get("regularMarketPreviousClose")
+        market_cap = fast.get("marketCap")
+    except:
+        current_price = None
+        market_cap = None
+
+    current_price = current_price or info.get("currentPrice")
+    market_cap = market_cap or info.get("marketCap")
+    trailing_pe = info.get("trailingPE") or info.get("forwardPE")
+    roe = info.get("returnOnEquity")
+    pb_ratio = info.get("priceToBook")
+    eps = info.get("trailingEps")
+    dividend_yield = info.get("dividendYield")
+    debt_to_equity = info.get("debtToEquity")
+
+    tabs = st.tabs([
+        "Overview",
+        "Investment Thesis",
+        "News & Events",
+        "Portfolio Advice"
+    ])
+
+    # ─── Overview ──────────────────────────────────────────────
+    with tabs[0]:
+        st.subheader(f"📊 {symbol}")
+
+        st.markdown(f"**Company:** {info.get('longName', symbol)}")
+        st.markdown(f"**Sector / Industry:** {info.get('sector', '—')} / {info.get('industry', '—')}")
+
+        with st.expander("Business Summary"):
+            st.caption(info.get("longBusinessSummary", "No description available."))
+
+        cols = st.columns(4)
+        cols[0].metric("Current Price", safe_format(current_price))
+        cols[1].metric("Market Cap", safe_format(market_cap, "{:,.0f}"))
+        cols[2].metric("P/E Ratio", safe_format(trailing_pe, "{:.1f}"))
+        cols[3].metric("ROE", safe_format(roe, "{:.1%}"))
+
+        st.markdown("---")
+        cols2 = st.columns(4)
+        cols2[0].metric("Price / Book", safe_format(pb_ratio, "{:.2f}"))
+        cols2[1].metric("EPS (TTM)", safe_format(eps, "{:.2f}"))
+        cols2[2].metric("Dividend Yield", safe_format(dividend_yield, "{:.2%}"))
+        cols2[3].metric("Debt / Equity", safe_format(debt_to_equity, "{:.1f}"))
+
+    # ─── Agents (unchanged) ────────────────────────────────────
+    @st.cache_resource
+    def get_agents():
+        fundamentals = Agent(
+            name="Fundamentals",
+            model=OpenAIChat(id="gpt-4o-mini"),
+            tools=[YFinanceTools(stock_fundamentals=True)],
+            instructions=(
+                "You are a financial analyst. "
+                "Use ONLY provided yfinance data. "
+                "Structure output: Valuation | Profitability | Growth | Leverage | Red Flags."
+            ),
+            markdown=True,
         )
-    ],
-    instructions=["Use markdown tables for data."],
-    show_tool_calls=True,
-    markdown=True,
-)
 
-multiAiAgent = Agent(
-    team=[websearch_agent, financeAgent],
-    instructions=[
-        "Return output in sections:",
-        "## Analyst Recommendations",
-        "## Latest News",
-        "## Sources",
-    ],
-    show_tool_calls=False,
-    markdown=True,
-)
+        news = Agent(
+            name="News",
+            model=OpenAIChat(id="gpt-4o-mini"),
+            tools=[DuckDuckGo()],
+            instructions=(
+                "Find 3–5 most important company events in last 9 months. "
+                "Format as numbered list with date, event, impact."
+            ),
+            markdown=True,
+        )
 
-# ---------------- Helper: parse markdown table ----------------
-def parse_markdown_table(table_text: str):
-    lines = [line.strip() for line in table_text.splitlines() if line.strip()]
+        decision = Agent(
+            name="Decision",
+            model=Groq(id="llama-3.3-70b-versatile"),
+            instructions=(
+                "You are a senior equity analyst. "
+                "Use ONLY provided fundamentals and news. "
+                "DO NOT invent numbers. "
+                "Return exactly:\n\n"
+                "## Verdict\n"
+                "## Confidence (High/Medium/Low)\n"
+                "## Time Horizon\n"
+                "## Key Reasons (3–5 bullets)\n"
+                "## Main Risks (2–4 bullets)"
+            ),
+            markdown=True,
+        )
+        return fundamentals, news, decision
 
-    header_line = None
-    for line in lines:
-        if line.startswith("|") and line.count("|") >= 2 and not set(line.replace("|","")).issubset({"-"," "}):
-            header_line = line
-            break
+    fundamental_agent, news_agent, decision_agent = get_agents()
 
-    if not header_line:
-        return None
+    # ─── Investment Thesis ─────────────────────────────────────
+    with tabs[1]:
+        with st.spinner("Building investment thesis..."):
+            fund_md = fundamental_agent.run(
+                f"Analyze fundamentals of {symbol}"
+            ).content
 
-    headers = [h.strip() for h in header_line.split("|")[1:-1]]
+            thesis = decision_agent.run(
+                f"Fundamentals:\n{fund_md}\n\nProvide investment thesis for {symbol}"
+            ).content
 
-    data_rows = []
-    header_found = False
-    for line in lines:
-        if line == header_line:
-            header_found = True
-            continue
+        st.markdown(thesis)
 
-        if not header_found:
-            continue
+        with st.expander("Raw Fundamentals Output"):
+            st.markdown(fund_md)
 
-        clean = line.replace("|", "").replace("-", "").strip()
-        if not clean:
-            continue
+    # ─── News & Events ─────────────────────────────────────────
+    with tabs[2]:
+        with st.spinner("Fetching recent catalysts..."):
+            events_md = news_agent.run(
+                f"Important news and events for {symbol}"
+            ).content
 
-        if line.startswith("|"):
-            cells = [c.strip() for c in line.split("|")[1:-1]]
-            data_rows.append(cells)
+        st.markdown("### 🛎️ Recent News & Catalysts")
+        st.markdown(events_md)
 
-    if not data_rows:
-        return None
+    # ─── Portfolio Advice ──────────────────────────────────────
+    with tabs[3]:
+        if qty > 0 and buy_price > 0 and current_price:
+            pnl = (current_price - buy_price) * qty
+            pnl_pct = ((current_price - buy_price) / buy_price) * 100
 
-    # normalize row lengths
-    normalized = []
-    for r in data_rows:
-        if len(r) < len(headers):
-            r += [""] * (len(headers) - len(r))
-        normalized.append(r[:len(headers)])
+            st.metric(
+                "Unrealized P&L",
+                safe_format(pnl, "{:,.0f}"),
+                f"{pnl_pct:+.1f}%",
+                delta_color="normal" if pnl >= 0 else "inverse"
+            )
 
-    try:
-        return pd.DataFrame(normalized, columns=headers)
-    except:
-        return None
+            with st.spinner("Generating position advice..."):
+                advice = decision_agent.run(
+                    f"User holds {qty} shares of {symbol} at {buy_price}. "
+                    f"Current price is {current_price}. "
+                    "Should they HOLD, ADD, TRIM, or EXIT?"
+                ).content
 
-# ---------------- Helper: key metrics ----------------
-def show_key_metrics(info: dict):
-    st.subheader("Key Metrics")
-
-    cp = info.get("currentPrice") or info.get("regularMarketPrice")
-    pct = info.get("regularMarketChangePercent")
-    mc = info.get("marketCap")
-    pe = info.get("trailingPE")
-
-    cols = st.columns(4)
-
-    cols[0].metric("Current Price", cp if cp else "N/A")
-    cols[1].metric("Day Change", f"{pct:.2f}%" if pct else "N/A")
-    cols[2].metric("Market Cap", f"{mc:,}" if isinstance(mc, int) else mc or "N/A")
-    cols[3].metric("P/E Ratio", f"{pe:.2f}" if pe else "N/A")
-
-# ---------------- Helper: price chart ----------------
-def show_price_chart(symbol: str):
-    st.subheader("Price History")
-    period = st.selectbox(
-        "Select Period",
-        ["1mo", "3mo", "6mo", "1y", "5y"],
-        index=2,
-        key=f"price_period_{symbol}",
-    )
-    data = yf.download(symbol, period=period)
-    if not data.empty:
-        st.line_chart(data["Close"])
-    else:
-        st.warning("No price data found.")
-
-# ---------------- Helper: fundamentals ----------------
-def show_fundamentals(symbol: str, info: dict):
-    st.subheader("Fundamentals")
-
-    fundamentals = {
-        "Market Cap": info.get("marketCap"),
-        "Enterprise Value": info.get("enterpriseValue"),
-        "Trailing P/E": info.get("trailingPE"),
-        "Forward P/E": info.get("forwardPE"),
-        "PEG Ratio": info.get("pegRatio"),
-        "Dividend Yield": info.get("dividendYield"),
-        "Return on Equity": info.get("returnOnEquity"),
-        "Return on Assets": info.get("returnOnAssets"),
-        "Book Value": info.get("bookValue"),
-        "EPS (TTM)": info.get("trailingEps"),
-    }
-
-    df = pd.DataFrame(
-        [{"Metric": k, "Value": v} for k, v in fundamentals.items() if v is not None]
-    )
-    st.table(df)
-
-    st.subheader("Annual Financials")
-    try:
-        fin = yf.Ticker(symbol).financials
-        if fin is not None and not fin.empty:
-            st.dataframe(fin.T)
+            st.markdown("### Recommendation")
+            st.markdown(advice)
         else:
-            st.info("Financial data unavailable.")
-    except:
-        st.error("Failed to load financials.")
+            st.info("Enter quantity & buy price in sidebar for portfolio advice.")
 
-# ---------------- Main display function ----------------
-def display_stock_info(symbol: str):
-    symbol = normalize_ticker(symbol)
-
-    # Tabs (NO COMPARISON TAB)
-    tab_overview, tab_fundamentals, tab_analysts, tab_news = st.tabs(
-        ["Overview", "Fundamentals", "Analysts", "News"]
-    )
-
-    with st.spinner(f"Loading data for {symbol}..."):
-        try:
-            t = yf.Ticker(symbol)
-            try:
-                info = t.info
-            except:
-                info = {}
-
-            # ---- AI response for analysts & news ----
-            response = multiAiAgent.run(
-                f"Provide analyst recommendations and latest news for {symbol}"
-            )
-            content = getattr(response, "content", "") or ""
-
-            analyst_match = re.search(
-                r"##+\s*Analyst Recommendations\s*(.*?)(?=\n##+|$)",
-                content,
-                flags=re.DOTALL,
-            )
-            news_match = re.search(
-                r"##+\s*Latest News\s*(.*?)(?=\n##+|$)",
-                content,
-                flags=re.DOTALL,
-            )
-
-            # ---- Overview ----
-            with tab_overview:
-                st.caption(f"Symbol used: **{symbol}**")
-                if info:
-                    show_key_metrics(info)
-                show_price_chart(symbol)
-
-            # ---- Fundamentals ----
-            with tab_fundamentals:
-                if info:
-                    show_fundamentals(symbol, info)
-                else:
-                    st.warning("No fundamentals available.")
-
-            # ---- Analysts ----
-            with tab_analysts:
-                if content:
-                    with st.expander("Show raw AI output"):
-                        st.markdown(content)
-
-                st.subheader("Analyst Recommendations")
-                if analyst_match:
-                    table_text = analyst_match.group(1)
-                    df = parse_markdown_table(table_text)
-                    if df is not None:
-                        st.dataframe(df, use_container_width=True)
-                    else:
-                        st.markdown(table_text)
-                else:
-                    st.info("No analyst data found.")
-
-            # ---- News ----
-            with tab_news:
-                st.subheader("Latest News")
-                if news_match:
-                    blocks = news_match.group(1).strip().split("\n- ")
-                    for item in blocks:
-                        item = item.strip()
-                        if item:
-                            st.markdown(f"<div class='news-item'>{item}</div>", unsafe_allow_html=True)
-                else:
-                    st.info("No news data found.")
-
-        except Exception as e:
-            st.error(f"Error fetching data: {e}")
-
-# ---------------- Run logic ----------------
-if submit_button:
-    display_stock_info(ticker)
-elif selected_from_watchlist:
-    display_stock_info(selected_from_watchlist)
+else:
+    st.info("Add a stock to watchlist or enter a symbol and click Analyze.")
